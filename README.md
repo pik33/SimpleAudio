@@ -1,6 +1,11 @@
-This is the audio unit independent of all the rest of the retromachine chaos. As it is now, it is written but not debugged yet so I think it is not in the working state. As I need this thing, I will now start debugging the unit.
+This is the audio unit independent of all the rest of the retromachine chaos. 
 
 Its API is modelled after SDL audio.
+
+Version 0.02 alpha
+
+What works: OpenAudio, PauseAudio. Now it can play 44100 Hz stereo 16-bit wav files.
+The rest of functions and wave format still untested.
 
 How to use this:
 
