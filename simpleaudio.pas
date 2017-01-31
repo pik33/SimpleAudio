@@ -2,7 +2,7 @@ unit simpleaudio;
 
 //------------------------------------------------------------------------------
 // A simple audio unit for Ultibo modelled after SDL audio API
-// v.0.02 alpha - 20170131
+// v.0.03 alpha - 20170131
 // pik33@o2.pl
 // gpl 2.0 or higher
 //------------------------------------------------------------------------------
@@ -177,13 +177,15 @@ var gpfsel4:cardinal     absolute _gpfsel4;      // GPIO Function Select 4
 
 
      nc:cardinal;
+     working:integer;
 
+// TODO : remove private variables from the interface
 
 procedure InitAudioEx(range,t_length:integer);
 function  OpenAudio(desired, obtained: PAudioSpec): Integer;
 function  ChangeAudioParams(desired, obtained: PAudioSpec): Integer;
 procedure CloseAudio;
-procedure PauseAudioA(p:integer);
+procedure pauseaudio(p:integer);
 procedure SetVolume(vol:single);
 procedure SetVolume(vol:integer);
 procedure setDBVolume(vol:single);
@@ -392,6 +394,7 @@ begin
 // -------------- TODO: what is common, should go to one place
 
 result:=0;
+if desired^.freq=0 then desired^.freq:=CurrentAudioSpec.freq;
 if desired^.freq<8000 then
   begin
   result:=freq_too_low;
@@ -402,16 +405,19 @@ if desired^.freq>960000 then
   result:=freq_too_high;
   exit;
   end;
+if desired^.format=0 then desired^.format:=CurrentAudioSpec.format;
 if (desired^.format <> AUDIO_U8) and (desired^.format <> AUDIO_S16) and (desired^.format <> AUDIO_F32) then
   begin
   result:=format_not_supported;
   exit;
   end;
+if desired^.channels=0 then desired^.channels:=CurrentAudioSpec.channels;
 if (desired^.channels < 1) or (desired^.channels>2) then
   begin
   result:=invalid_channel_number;
   exit;
   end;
+if desired^.samples=0 then desired^.samples:=CurrentAudioSpec.samples ;
 if (desired^.samples<32) then
   begin
   result:=size_too_low;
@@ -423,11 +429,7 @@ if (desired^.samples>maxsize) then
   result:=size_too_high;
   exit;
   end;
-if (desired^.callback=nil) then
-  begin
-  result:=callback_not_specified;
-  exit;
-  end;
+if (desired^.callback=nil) then  desired^.callback:=CurrentAudioSpec.callback;
 
 obtained^:=desired^;
 obtained^.oversample:=960000 div desired^.freq;
@@ -468,8 +470,34 @@ if obtained^.oversampled_size<>CurrentAudioSpec.oversampled_size then
 // We cannot do this here while the worker thread is running
 // so we only can ask it to do
 
-if obtained^.size>CurrentAudioSpec.size then AudioThread.ResizeAudioBuffer(obtained^.size);
-if (obtained^.samples*obtained^.channels)>(CurrentAudioSpec.samples*CurrentAudioSpec.channels) then AudioThread.ResizeSample32Buffer(obtained^.samples*obtained^.channels);
+
+
+// now don't mess with CurrentAudioSpec if the worker is processing the audio
+repeat until working=1;
+repeat until working=0;
+
+if obtained^.size>CurrentAudioSpec.size then
+  begin
+//  pauseaudio(1);
+  repeat until working=1;
+  repeat until working=0;
+  AudioThread.ResizeAudioBuffer(obtained^.size);
+  repeat until working=1;
+//  pauseaudio(0);
+  end;
+
+if (obtained^.samples*obtained^.channels)>(CurrentAudioSpec.samples*CurrentAudioSpec.channels) then
+  begin
+//  pauseaudio(1);
+  repeat until working=1;
+  repeat until working=0;
+  AudioThread.ResizeSample32Buffer(obtained^.samples*obtained^.channels);
+  repeat until working=1;
+ // pauseaudio(0);
+  end;
+
+repeat until working=1;
+repeat until working=0;
 CurrentAudioSpec:=obtained^;
 end;
 
@@ -501,10 +529,11 @@ freemem(dmactrl_ptr);
 freemem(samplebuffer_ptr);
 end;
 
-procedure pauseaudioA(p:integer);
+procedure pauseaudio(p:integer);
 
 begin
-pauseA:=p;
+if p=1 then pauseA:=1;
+if p=0 then pausea:=0;
 end;
 
 procedure SetVolume(vol:single);
@@ -633,8 +662,9 @@ ThreadSetCPU(ThreadGetCurrent,CPU_ID_1);
 threadsleep(1);
   repeat
   repeat sleep(0) until (dma_cs and 2) <>0 ;
+  working:=1;
   nc:=dma_nextcb;
-  if pauseA=1 then  // clean the buffers
+  if pauseA>0 then  // clean the buffers
     begin
     if nc=nocache+ctrl1_adr then for i:=0 to 16383 do dmabuf1_ptr[i]:=CurrentAudioSpec.range div 2;
     if nc=nocache+ctrl2_adr then for i:=0 to 16383 do dmabuf2_ptr[i]:=CurrentAudioSpec.range div 2;
@@ -643,8 +673,6 @@ threadsleep(1);
     end
   else
     begin
-
-//    for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= 4096*samplebuffer_ptr_si[i]+$8000000;
 
     // if not pause then we should call audiocallback to fill the buffer
 
@@ -655,17 +683,17 @@ threadsleep(1);
     if CurrentAudioSpec.channels=2 then // stereo
       begin
       case CurrentAudioSpec.format of
-        AUDIO_U8:  for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*256*samplebuffer_ptr_si[i];
+        AUDIO_U8:  for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*256*samplebuffer_ptr_b[i];
         AUDIO_S16: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*samplebuffer_ptr_si[i]+$8000000;
-        AUDIO_F32: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= round(volume*32768*samplebuffer_ptr_si[i])+$8000000;
+        AUDIO_F32: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= round(volume*32768*samplebuffer_ptr_f[i])+$8000000;
         end;
       end
     else
       begin
       case CurrentAudioSpec.format of
-        AUDIO_U8:  for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*256*samplebuffer_ptr_si[i shr 1];
+        AUDIO_U8:  for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*256*samplebuffer_ptr_b[i shr 1];
         AUDIO_S16: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= volume*samplebuffer_ptr_si[i shr 1]+$8000000;
-        AUDIO_F32: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= round(volume*32768*samplebuffer_ptr_si[i shr 1])+$8000000;
+        AUDIO_F32: for i:=0 to 2*CurrentAudioSpec.samples-1 do samplebuffer_32_ptr[i]:= round(volume*32768*samplebuffer_ptr_f[i shr 1])+$8000000;
         end;
       end;
     if nc=nocache+ctrl1_adr then noiseshaper8(samplebuffer_32_adr,dmabuf1_adr,CurrentAudioSpec.oversample,CurrentAudioSpec.samples)
@@ -682,9 +710,10 @@ threadsleep(1);
   if resize32>0 then
     begin
     freemem(samplebuffer_32_ptr);
-    samplebuffer_32_ptr:=getmem(resize32);
+    samplebuffer_32_ptr:=getmem(resize32*4);
     resize32:=0;
     end;
+  working:=0;
   until terminated;
 AudioOn:=0;
 end;

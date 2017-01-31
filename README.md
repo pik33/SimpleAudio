@@ -2,10 +2,18 @@ This is the audio unit independent of all the rest of the retromachine chaos.
 
 Its API is modelled after SDL audio.
 
-Version 0.02 alpha
+Version 0.03 alpha
 
-What works: OpenAudio, PauseAudio. Now it can play 44100 Hz stereo 16-bit wav files.
+The changelog:
+
+0.03: ChangeAudioParams works; 32-bit/stereo/96 kHz .wav tested OK 
+
+0.02: What works: OpenAudio, PauseAudio. Now it can play 44100 Hz stereo 16-bit wav files.
 The rest of functions and wave format still untested.
+
+0.01: First commit, untested; OpenAudioEx works, the rest untested
+
+-----------------------------------------------------------------------------
 
 How to use this:
 
