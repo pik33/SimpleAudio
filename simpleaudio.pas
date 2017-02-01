@@ -2,7 +2,7 @@ unit simpleaudio;
 
 //------------------------------------------------------------------------------
 // A simple audio unit for Ultibo modelled after SDL audio API
-// v.0.03 alpha - 20170131
+// v.0.90 beta - 20170201
 // pik33@o2.pl
 // gpl 2.0 or higher
 //------------------------------------------------------------------------------
@@ -46,24 +46,77 @@ TAudioSpec = record
   oversampled_size: integer; // oversampled buffer size
   end;
 
-PLongBuffer=^TLongBuffer;
-TLongBuffer=array[0..65535] of integer;  // 64K DMA buffer
-TCtrlBlock=array[0..7] of cardinal;
-PCtrlBlock=^TCtrlBlock;
+
+const
+
+// ---------- Error codes
+
+      freq_too_low=            -$11;
+      freq_too_high=           -$12;
+      format_not_supported=    -$21;
+      invalid_channel_number=  -$41;
+      size_too_low =           -$81;
+      size_too_high=           -$81;
+      callback_not_specified= -$101;
+
+// ---------- Audio formats. Subset of SDL formats
+// ---------- These are 99.99% of wave file formats:
+
+      AUDIO_U8  = $0008; // Unsigned 8-bit samples
+      AUDIO_S16 = $8010; // Signed 16-bit samples
+      AUDIO_F32 = $8120; // Float 32 bit
+
+
+// SDL based functions
+function  OpenAudio(desired, obtained: PAudioSpec): Integer;
+procedure CloseAudio;
+procedure PauseAudio(p:integer);
+
+// Functions not in SDL API
+function  ChangeAudioParams(desired, obtained: PAudioSpec): Integer;
+procedure SetVolume(vol:single);
+procedure SetVolume(vol:integer);
+procedure setDBVolume(vol:single);
+
+// Simplified functions
+function  SA_OpenAudio(freq,bits,channels,samples:integer; callback: TAudioSpecCallback):integer;
+function  SA_ChangeParams(freq,bits,channels,samples:integer): Integer;
+function  SA_GetCurrentFreq:integer;
+function  SA_GetCurrentRange:integer;
+
+//------------------ End of Interface ------------------------------------------
+
+implementation
+
+type
+     PLongBuffer=^TLongBuffer;
+     TLongBuffer=array[0..65535] of integer;  // 64K DMA buffer
+     TCtrlBlock=array[0..7] of cardinal;
+     PCtrlBlock=^TCtrlBlock;
 
 TAudioThread= class(TThread)
 private
-  resize:integer;
-  resize32:integer;
 protected
   procedure Execute; override;
-  procedure ResizeAudioBuffer(size:integer);
-  procedure ResizeSample32Buffer(size32:integer);
 public
  Constructor Create(CreateSuspended : boolean);
 end;
 
+
 const nocache=$C0000000;              // constant to disable GPU L2 Cache
+      pll_freq=500000000;             // base PLL freq=500 MHz
+      pwm_base_freq=1920000;
+      divider=2;
+      base_freq=pll_freq div divider;
+      max_pwm_freq=pwm_base_freq div divider;
+
+      dma_buffer_size=65536;          // max size for simplified channel
+
+// TODO: make the sample buffer size dynamic (?)
+
+      sample_buffer_size=2048;        // max size for sample buffer.
+                                      // The max allowed by dma_buffer_size is 1536 for 44100/16/2 wave
+      sample_buffer_32_size=16384;     // 8x sample_buffer_size for 8-bit mono samples
 
 // ------- Hardware registers addresses --------------------------------------
 
@@ -94,7 +147,7 @@ const nocache=$C0000000;              // constant to disable GPU L2 Cache
       or_mask_40_45_4= %00000000000000100000000000000100;  // OR mask for set Alt Function #0 @ GPIO 40 and 45
 
       clk_plld=     $5a000016;       // set clock to PLL D
-      clk_div_2=    $5a002000;       // set clock divisor to 2.0
+      clk_div=      $5a000000 + divider shl 12;  //002000;       // set clock divisor to 2.0
 
       pwm_ctl_val=  $0000a1e1;       // value for PWM init:
                                      // bit 15: chn#2 set M/S mode=1. Use PWM mode for non-noiseshaped audio and M/S mode for oversampled noiseshaped audio
@@ -107,93 +160,64 @@ const nocache=$C0000000;              // constant to disable GPU L2 Cache
 
       pwm_dmac_val= $80000707;       // PWM DMA ctrl value:
                                      // bit 31: enable DMA
-                                     // bits 15..8: PANIC value: when less than 3 entries in FIFO, raise DMA priority
-                                     // bits 7..0: DREQ value: request the data if less than 7 entries in FIFO
+                                     // bits 15..8: PANIC value
+                                     // bits 7..0: DREQ value
 
       dma_chn= 14;                   // use DMA channel 14 (the last)
 
-// ---------- Error codes
 
-      freq_too_low=            -$11;
-      freq_too_high=           -$12;
-      format_not_supported=    -$21;
-      invalid_channel_number=  -$41;
-      size_too_low =           -$81;
-      size_too_high=           -$81;
-      callback_not_specified= -$101;
+var       gpfsel4:cardinal     absolute _gpfsel4;      // GPIO Function Select 4
+          pwmclk:cardinal      absolute _pwmclk;       // PWM Clock ctrl
+          pwmclk_div: cardinal absolute _pwmclk_div;   // PWM Clock divisor
+          pwm_ctl:cardinal     absolute _pwm_ctl;      // PWM Control Register
+          pwm_dmac:cardinal    absolute _pwm_dmac;     // PWM DMA Configuration MMU address
+          pwm_rng1:cardinal    absolute _pwm_rng1;     // PWM Range channel #1 MMU address
+          pwm_rng2:cardinal    absolute _pwm_rng2;     // PWM Range channel #2 MMU address
 
-// ---------- Audio formats. Subset of SDL formats
-// ---------- These are 99.99% of wave file formats:
+          dma_enable:cardinal  absolute _dma_enable;   // DMA Enable register
 
-      AUDIO_U8  = $0008; // Unsigned 8-bit samples
-      AUDIO_S16 = $8010; // Signed 16-bit samples
-      AUDIO_F32 = $8120; // Float 32 bit
+          dma_cs:cardinal      absolute _dma_cs+($100*dma_chn); // DMA ctrl/status
+          dma_conblk:cardinal  absolute _dma_conblk+($100*dma_chn); // DMA ctrl block addr
+          dma_nextcb:cardinal  absolute _dma_nextcb+($100*dma_chn); // DMA next ctrl block addr
 
+          dmactrl_ptr:PCardinal=nil;                   // DMA ctrl block pointer
+          dmactrl_adr:cardinal absolute dmactrl_ptr;       // DMA ctrl block address
+          dmabuf1_ptr:PCardinal=nil;                 // DMA data buffer #1 pointer
+          dmabuf1_adr:cardinal absolute dmabuf1_ptr;   // DMA data buffer #1 address
+          dmabuf2_ptr:PCardinal=nil;                 // DMA data buffer #2 pointer
+          dmabuf2_adr:cardinal absolute dmabuf2_ptr;   // DMA data buffer #2 address
 
-
-
-var gpfsel4:cardinal     absolute _gpfsel4;      // GPIO Function Select 4
-    pwmclk:cardinal      absolute _pwmclk;       // PWM Clock ctrl
-    pwmclk_div: cardinal absolute _pwmclk_div;   // PWM Clock divisor
-    pwm_ctl:cardinal     absolute _pwm_ctl;      // PWM Control Register
-    pwm_dmac:cardinal    absolute _pwm_dmac;     // PWM DMA Configuration MMU address
-    pwm_rng1:cardinal    absolute _pwm_rng1;     // PWM Range channel #1 MMU address
-    pwm_rng2:cardinal    absolute _pwm_rng2;     // PWM Range channel #2 MMU address
-
-    dma_enable:cardinal  absolute _dma_enable;   // DMA Enable register
-
-    dma_cs:cardinal      absolute _dma_cs+($100*dma_chn); // DMA ctrl/status
-    dma_conblk:cardinal  absolute _dma_conblk+($100*dma_chn); // DMA ctrl block addr
-    dma_nextcb:cardinal  absolute _dma_nextcb+($100*dma_chn); // DMA next ctrl block addr
-
-    dmactrl_ptr:PCardinal=nil;                   // DMA ctrl block pointer
-    dmactrl_adr:cardinal absolute dmactrl_ptr;       // DMA ctrl block address
-    dmabuf1_ptr:PCardinal=nil;                 // DMA data buffer #1 pointer
-    dmabuf1_adr:cardinal absolute dmabuf1_ptr;   // DMA data buffer #1 address
-    dmabuf2_ptr:PCardinal=nil;                 // DMA data buffer #2 pointer
-    dmabuf2_adr:cardinal absolute dmabuf2_ptr;   // DMA data buffer #2 address
-
-    ctrl1_ptr,ctrl2_ptr:PCtrlBlock;              // DMA ctrl block array pointers
-    ctrl1_adr:cardinal absolute ctrl1_ptr;       // DMA ctrl block #1 array address
-    ctrl2_adr:cardinal absolute ctrl2_ptr;       // DMA ctrl block #2 array address
+          ctrl1_ptr,ctrl2_ptr:PCtrlBlock;              // DMA ctrl block array pointers
+          ctrl1_adr:cardinal absolute ctrl1_ptr;       // DMA ctrl block #1 array address
+          ctrl2_adr:cardinal absolute ctrl2_ptr;       // DMA ctrl block #2 array address
 
 
-    CurrentAudioSpec:TAudioSpec;
+          CurrentAudioSpec:TAudioSpec;
 
-    SampleBuffer_ptr:pointer;
-    SampleBuffer_ptr_b:PByte absolute SampleBuffer_ptr;
-    SampleBuffer_ptr_si:PSmallint absolute SampleBuffer_ptr;
-    SampleBuffer_ptr_f:PSingle absolute SampleBuffer_ptr;
-    SampleBuffer_adr:cardinal absolute SampleBuffer_ptr;
+          SampleBuffer_ptr:pointer;
+          SampleBuffer_ptr_b:PByte absolute SampleBuffer_ptr;
+          SampleBuffer_ptr_si:PSmallint absolute SampleBuffer_ptr;
+          SampleBuffer_ptr_f:PSingle absolute SampleBuffer_ptr;
+          SampleBuffer_adr:cardinal absolute SampleBuffer_ptr;
 
-    SampleBuffer_32_ptr:PCardinal;
-    SampleBuffer_32_adr:cardinal absolute SampleBuffer_32_ptr;
+          SampleBuffer_32_ptr:PCardinal;
+          SampleBuffer_32_adr:cardinal absolute SampleBuffer_32_ptr;
 
-    AudioThread:TAudioThread;
+          AudioThread:TAudioThread;
 
-    AudioOn:integer=0;                 // 1 - audio worker thread is running
-    volume:integer=4096;               // audio volume; 4096 -> 0 dB
-    pauseA:integer=1;                   // 1 - audio is paused
+          AudioOn:integer=0;                 // 1 - audio worker thread is running
+          volume:integer=4096;               // audio volume; 4096 -> 0 dB
+          pauseA:integer=1;                   // 1 - audio is paused
 
 
-     nc:cardinal;
-     working:integer;
+          nc:cardinal;
+          working:integer;
 
-// TODO : remove private variables from the interface
+          s_desired, s_obtained: TAudioSpec;
 
-procedure InitAudioEx(range,t_length:integer);
-function  OpenAudio(desired, obtained: PAudioSpec): Integer;
-function  ChangeAudioParams(desired, obtained: PAudioSpec): Integer;
-procedure CloseAudio;
-procedure pauseaudio(p:integer);
-procedure SetVolume(vol:single);
-procedure SetVolume(vol:integer);
-procedure setDBVolume(vol:single);
-function noiseshaper8(bufaddr,outbuf,oversample,len:integer):integer;
+procedure InitAudioEx(range,t_length:integer);  forward;
+function noiseshaper8(bufaddr,outbuf,oversample,len:integer):integer; forward;
 
-implementation
-
-uses retromalina;
 // ------------------------------------------------
 // A helper procedure which removes RAM RO limit
 // used here to speed up the noise shaper
@@ -224,18 +248,6 @@ ctrl1_ptr:=PCtrlBlock(dmactrl_ptr);     // set pointers so the ctrl blocks can b
 ctrl2_ptr:=PCtrlBlock(dmactrl_ptr+8);   // second ctrl block is 8 longs further
 dmabuf1_ptr:=getmem(65536);                       // allocate 64k for DMA buffer
 dmabuf2_ptr:=getmem(65536);                       // .. and the second one
-//dmabuf1_adr:=integer(getalignedmem($10000,$10000)); //$9000000;
-//dmabuf2_adr:=integer(getalignedmem($10000,$10000));//$9100000;
-
-// Clean the buffers.
-
-//for i:=0 to 16383 do dmabuf1_ptr[i]:=range div 2;
-//CleanDataCacheRange(dmabuf1_adr,$10000);
-//for i:=0 to 16383 do dmabuf2_ptr[i]:=range div 2;
-//CleanDataCacheRange(dmabuf2_adr,$10000);
-
-// Init DMA control blocks so they will form the endless loop
-// pushing two buffers to PWM FIFO
 
 ctrl1_ptr^[0]:=transfer_info;             // transfer info
 ctrl1_ptr^[1]:=nocache+dmabuf1_adr;       // source address -> buffer #1
@@ -255,20 +267,62 @@ sleep(1);
 
 gpfsel4:=(gpfsel4 and and_mask_40_45) or or_mask_40_45_4;  // gpio 40/45 as alt#0 -> PWM Out
 pwmclk:=clk_plld;                                          // set PWM clock src=PLLD (500 MHz)
-pwmclk_div:=clk_div_2;                                     // set PWM clock divisor=2 (250 MHz)
-pwm_rng1:=range;                                             // minimum range for 8-bit noise shaper to avoid overflows
-pwm_rng2:=range;                                             //
+pwmclk_div:=clk_div;                                       // set PWM clock divisor=2 (250 MHz)
+pwm_rng1:=range;                                           // minimum range for 8-bit noise shaper to avoid overflows
+pwm_rng2:=range;                                           //
 pwm_ctl:=pwm_ctl_val;                                      // pwm contr0l - enable pwm, clear fifo, use fifo
 pwm_dmac:=pwm_dmac_val;                                    // pwm dma enable
 dma_enable:=dma_enable or (1 shl dma_chn);                 // enable dma channel # dma_chn
-dma_conblk:=nocache+ctrl1_adr;                                 // init DMA ctr block to ctrl block # 1
-dma_cs:=3;                                                 // start DMA
+dma_conblk:=nocache+ctrl1_adr;                             // init DMA ctr block to ctrl block # 1
+dma_cs:=$00FF0003;                                         // start DMA
 end;
 
 
+function SA_OpenAudio(freq,bits,channels,samples:integer; callback: TAudioSpecCallback):integer;
+
+begin
+s_desired.freq:=freq;
+s_desired.samples:=samples;
+s_desired.channels:=channels;
+s_desired.samples:=samples;
+s_desired.callback:=callback;
+case bits of
+  8:s_desired.format:= AUDIO_U8;
+  16:s_desired.format:=AUDIO_S16;
+  32:s_desired.format:=AUDIO_F32;
+  else
+    begin
+    result:=format_not_supported;
+    exit;
+    end;
+  end;
+result:=OpenAudio(@s_desired,@s_obtained);
+end;
+
+function  SA_ChangeParams(freq,bits,channels,samples:integer): Integer;
+
+begin
+s_desired.freq:=freq;
+s_desired.samples:=samples;
+s_desired.channels:=channels;
+s_desired.samples:=samples;
+s_desired.callback:=nil;
+case bits of
+  0:s_desired.format:=0;
+  8:s_desired.format:= AUDIO_U8;
+  16:s_desired.format:=AUDIO_S16;
+  32:s_desired.format:=AUDIO_F32;
+  else
+    begin
+    result:=format_not_supported;
+    exit;
+    end;
+  end;
+result:=ChangeAudioParams(@s_desired,@s_obtained);
+end;
 // ----------------------------------------------------------------------
 // OpenAudio
-// Inits the audio accordng to specifications in 'desired' record
+// Inits the audio according to specifications in 'desired' record
 // The values which in reality had been set are in 'obtained' record
 // Returns 0 or the error code, in this case 'obtained' is invalid
 //
@@ -301,7 +355,7 @@ if desired^.freq<8000 then
   exit;
   end;
 
-if desired^.freq>960000 then
+if desired^.freq>max_pwm_freq then
   begin
   result:=freq_too_high;
   exit;
@@ -333,7 +387,7 @@ if (desired^.samples<32) then
   exit;
   end;
 
-maxsize:=65528/960000*desired^.freq/desired^.channels;
+maxsize:=65528/max_pwm_freq*desired^.freq/desired^.channels;
 
 if (desired^.samples>maxsize) then
   begin
@@ -351,28 +405,43 @@ if (desired^.callback=nil) then
 
 obtained^:=desired^;
 
-obtained^.oversample:=960000 div desired^.freq;
+obtained^.oversample:=max_pwm_freq div desired^.freq;
+
+  // the workaround for simply making 432 Hz tuned sound
+  // the problem is: when going 44100->43298
+  // the computed oversample changes from 21 to 22
+  // and this causes the resulting DMA buffer exceed 64K
+  // Also if I init the 43298 Hz soud, I will want to change it to 44100
+  // without changing anything else
+
+  if obtained^.oversample=22 then obtained^.oversample:=21;
+
 over_freq:=desired^.freq*obtained^.oversample;
-obtained^.range:=round(250000000/over_freq);
-obtained^.freq:=round(250000000/(obtained^.range*obtained^.oversample));
+obtained^.range:=round(base_freq/over_freq);
+obtained^.freq:=round(base_freq/(obtained^.range*obtained^.oversample));
 if (desired^.format = AUDIO_U8) then obtained^.silence:=128 else obtained^.silence:=0;
 obtained^.padding:=0;
 obtained^.size:=obtained^.samples*obtained^.channels;
+if obtained^.size>sample_buffer_size then
+  begin
+  result:=size_too_high;
+  exit;
+  end;
+
 obtained^.oversampled_size:=obtained^.size*4*obtained^.oversample;
 if obtained^.format=AUDIO_U8 then obtained^.size:=obtained^.size;
 if obtained^.format=AUDIO_S16 then obtained^.size:=obtained^.size*2;
 if obtained^.format=AUDIO_F32 then obtained^.size:=obtained^.size*4;
 InitAudioEx(obtained^.range,obtained^.oversampled_size);
 CurrentAudioSpec:=obtained^;
-samplebuffer_ptr:=getmem(obtained^.size);
-samplebuffer_32_ptr:=getmem(obtained^.samples*obtained^.channels*4);
+samplebuffer_ptr:=getmem(sample_buffer_size);
+samplebuffer_32_ptr:=getmem(sample_buffer_32_size);
 removeramlimits(integer(@noiseshaper8));  // noise shaper uses local vars or it will be slower
 // now create and start the audio thread
 pauseA:=1;
 AudioThread:=TAudioThread.Create(true);
 AudioThread.start;
 end;
-
 
 
 // ---------- ChangeAudioParams -----------------------------------------
@@ -400,7 +469,7 @@ if desired^.freq<8000 then
   result:=freq_too_low;
   exit;
   end;
-if desired^.freq>960000 then
+if desired^.freq>max_pwm_freq then
   begin
   result:=freq_too_high;
   exit;
@@ -423,7 +492,7 @@ if (desired^.samples<32) then
   result:=size_too_low;
   exit;
   end;
-maxsize:=65528/960000*desired^.freq/desired^.channels;
+maxsize:=65528/max_pwm_freq*desired^.freq/desired^.channels;
 if (desired^.samples>maxsize) then
   begin
   result:=size_too_high;
@@ -432,13 +501,26 @@ if (desired^.samples>maxsize) then
 if (desired^.callback=nil) then  desired^.callback:=CurrentAudioSpec.callback;
 
 obtained^:=desired^;
-obtained^.oversample:=960000 div desired^.freq;
+obtained^.oversample:=max_pwm_freq div desired^.freq;
+  // the workaround for simply making 432 Hz tuned sound
+  // the problem is: when going 44100->43298
+  // the computed oversample changes from 21 to 22
+  // and this causes the resulting DMA buffer exceed 64K
+
+  if obtained^.oversample=22 then obtained^.oversample:=21;
+
 over_freq:=desired^.freq*obtained^.oversample;
-obtained^.range:=round(250000000/over_freq);
-obtained^.freq:=round(250000000/(obtained^.range*obtained^.oversample));
+obtained^.range:=round(base_freq/over_freq);
+obtained^.freq:=round(base_freq/(obtained^.range*obtained^.oversample));
 if (desired^.format = AUDIO_U8) then obtained^.silence:=128 else obtained^.silence:=0;
 obtained^.padding:=0;
 obtained^.size:=obtained^.samples*obtained^.channels;
+if obtained^.size>sample_buffer_size then
+  begin
+  result:=size_too_high;
+  exit;
+  end;
+
 obtained^.oversampled_size:=obtained^.size*4*obtained^.oversample;
 if obtained^.format=AUDIO_U8 then obtained^.size:=obtained^.size div 2;
 if obtained^.format=AUDIO_F32 then obtained^.size:=obtained^.size *2;
@@ -449,7 +531,6 @@ if obtained^.format=AUDIO_F32 then obtained^.size:=obtained^.size *2;
 // Instead we will change - only when needed:
 //
 // - PWM range
-// - sample buffer
 // - DMA transfer length
 
 if obtained^.range<>CurrentAudioSpec.range then
@@ -462,38 +543,10 @@ if obtained^.range<>CurrentAudioSpec.range then
 
 if obtained^.oversampled_size<>CurrentAudioSpec.oversampled_size then
   begin
+  repeat sleep(0) until dma_nextcb=nocache+ctrl2_adr;
   ctrl1_ptr^[3]:=obtained^.oversampled_size;
+  repeat sleep(0) until dma_nextcb=nocache+ctrl1_adr;
   ctrl2_ptr^[3]:=obtained^.oversampled_size;
-  end;
-
-// Now the worst case: we need a longer buffer.
-// We cannot do this here while the worker thread is running
-// so we only can ask it to do
-
-
-
-// now don't mess with CurrentAudioSpec if the worker is processing the audio
-repeat until working=1;
-repeat until working=0;
-
-if obtained^.size>CurrentAudioSpec.size then
-  begin
-//  pauseaudio(1);
-  repeat until working=1;
-  repeat until working=0;
-  AudioThread.ResizeAudioBuffer(obtained^.size);
-  repeat until working=1;
-//  pauseaudio(0);
-  end;
-
-if (obtained^.samples*obtained^.channels)>(CurrentAudioSpec.samples*CurrentAudioSpec.channels) then
-  begin
-//  pauseaudio(1);
-  repeat until working=1;
-  repeat until working=0;
-  AudioThread.ResizeSample32Buffer(obtained^.samples*obtained^.channels);
-  repeat until working=1;
- // pauseaudio(0);
   end;
 
 repeat until working=1;
@@ -512,14 +565,18 @@ begin
 AudioThread.terminate;
 repeat sleep(1) until AudioOn=1;
 
-// Disable PWM...
-
-pwm_ctl:=0;
-
 // ...then switch off DMA...
 
 ctrl1_ptr^[5]:=0;
 ctrl2_ptr^[5]:=0;
+
+// up to 8 ms of audio can still reside in the buffer
+
+sleep(20);
+
+// Now disable PWM...
+
+pwm_ctl:=0;
 
 //... and return the memory to the system
 
@@ -624,8 +681,6 @@ p999:           pop {r0-r10,r12,r14}
 CleanDataCacheRange(outbuf,$10000);
 end;
 
-
-
 // Audio thread
 // After the audio is opened it calls audiocallback when needed
 
@@ -634,21 +689,10 @@ constructor TAudioThread.Create(CreateSuspended : boolean);
 
 begin
 FreeOnTerminate := True;
-resize:=0;
 inherited Create(CreateSuspended);
 end;
 
-procedure TAudioThread.ResizeAudioBuffer(size:integer);
 
-begin
-resize:=size;
-end;
-
-procedure TAudioThread.ResizeSample32Buffer(size32:integer);
-
-begin
-resize32:=size32;
-end;
 
 procedure TAudioThread.Execute;
 
@@ -659,6 +703,7 @@ var
 begin
 AudioOn:=1;
 ThreadSetCPU(ThreadGetCurrent,CPU_ID_1);
+ThreadSetPriority(ThreadGetCurrent,7);
 threadsleep(1);
   repeat
   repeat sleep(0) until (dma_cs and 2) <>0 ;
@@ -700,25 +745,23 @@ threadsleep(1);
     else noiseshaper8(samplebuffer_32_adr,dmabuf2_adr,CurrentAudioSpec.oversample,CurrentAudioSpec.samples);
     if nc=nocache+ctrl1_adr then CleanDataCacheRange(dmabuf1_adr,$10000) else CleanDataCacheRange(dmabuf2_adr,$10000);
     end;
-  dma_cs:=3;
-  if resize>0 then
-    begin
-    freemem(samplebuffer_ptr);
-    samplebuffer_ptr:=getmem(resize);
-    resize:=0;
-    end;
-  if resize32>0 then
-    begin
-    freemem(samplebuffer_32_ptr);
-    samplebuffer_32_ptr:=getmem(resize32*4);
-    resize32:=0;
-    end;
+  dma_cs:=$00FF0003;
   working:=0;
   until terminated;
 AudioOn:=0;
 end;
 
+function  SA_GetCurrentFreq:integer;
 
+begin
+result:=CurrentAudioSpec.freq;
+end;
+
+function  SA_GetCurrentRange:integer;
+
+begin
+result:=CurrentAudioSpec.range;
+end;
 
 end.
 
