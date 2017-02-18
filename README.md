@@ -1,8 +1,10 @@
-This is the audio unit independent of all the rest of the retromachine chaos. 
+This is the audio unit for Ultbo environment. 
 
-Version 0.90 beta
+Version 0.91 beta
 
 The changelog:
+
+0.91: bug fixed which causes improper playing 1-channel audio
 
 0.90: all functions seems to work, so beta stage reached. Now TODO: make an pure Ultibo example of using this
 
