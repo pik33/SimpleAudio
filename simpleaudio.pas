@@ -2,7 +2,7 @@ unit simpleaudio;
 
 //------------------------------------------------------------------------------
 // A simple audio unit for Ultibo modelled after SDL audio API
-// v.0.91 beta - 20170218
+// v.0.92 beta - 20180426
 // pik33@o2.pl
 // gpl 2.0 or higher
 //------------------------------------------------------------------------------
@@ -113,7 +113,7 @@ end;
 
 const nocache=$C0000000;              // constant to disable GPU L2 Cache
       pll_freq=500000000;             // base PLL freq=500 MHz
-      pwm_base_freq=1920000;
+      pwm_base_freq=1923077;
 
       divider=2;
 
@@ -124,9 +124,9 @@ const nocache=$C0000000;              // constant to disable GPU L2 Cache
 
 // TODO: make the sample buffer size dynamic (?)
 
-      sample_buffer_size=2048;        // max size for sample buffer.
-                                      // The max allowed by dma_buffer_size is 1536 for 44100/16/2 wave
-      sample_buffer_32_size=16384;     // 8x sample_buffer_size for 8-bit mono samples
+      sample_buffer_size=32768;        // max size for sample buffer.
+                                    
+      sample_buffer_32_size=65536;    
 
 // ------- Hardware registers addresses --------------------------------------
 
