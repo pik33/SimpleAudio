@@ -9,6 +9,7 @@ unit simpleaudio;
 //
 // beta changelog
 //
+// 0.92 - fixed the bug which caused distortions while playing at 960 kHz sample rate
 // 0.91 - fixed the bug which caused 1-channel sound play badly distorted
 //
 //------------------------------------------------------------------------------
