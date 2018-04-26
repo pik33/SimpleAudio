@@ -1,8 +1,9 @@
 This is the audio unit for Ultbo environment. 
 
-Version 0.91 beta
+Version 0.92 beta
 
 The changelog:
+0.92: bug fixed: too short buffer size caused problems when playing audio at 960 kHz sample rate
 
 0.91: bug fixed which causes improper playing 1-channel audio
 
